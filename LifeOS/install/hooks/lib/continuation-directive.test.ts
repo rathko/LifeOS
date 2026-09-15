@@ -9,7 +9,7 @@
  * while a missed grant costs one rephrase.
  */
 import { expect, test, describe } from "bun:test";
-import { parseAutoContinueDirective, DIRECTIVE_DEFAULT_MS, DIRECTIVE_MAX_MS, DIRECTIVE_DEFAULT_CAP, DIRECTIVE_MAX_CAP } from "./continuation-directive";
+import { parseAutoContinueDirective, DIRECTIVE_DEFAULT_MS, DIRECTIVE_MAX_MS, DIRECTIVE_DEFAULT_CAP, DIRECTIVE_MAX_CAP, DIRECTIVE_OVERNIGHT_MS } from "./continuation-directive";
 
 const NOW = 1_000_000;
 
@@ -40,6 +40,39 @@ describe("arming forms — keyword plus an explicit cue", () => {
   test("an explicit cap is honoured", () => {
     expect(parseAutoContinueDirective("auto-continue for 2h cap 10", NOW)?.cap).toBe(10);
     expect(parseAutoContinueDirective("auto-continue for 2h, up to 12 turns", NOW)?.cap).toBe(12);
+  });
+});
+
+describe("overnight forms — the 'back in the morning' family (8h window)", () => {
+  test.each([
+    "auto-continue overnight",
+    "auto-continue all night",
+    "auto-continue for the night",
+    "auto-continue for all night, I will be back in the morning",
+    "auto-continue until morning",
+    "auto-continue till the morning",
+    "auto-continue while I sleep",
+    "auto-continue while I'm away",
+    "auto-continue, I'll be back in the morning",
+  ])("'%s' arms for the overnight window", (p) => {
+    const d = parseAutoContinueDirective(p, NOW);
+    expect(d?.action).toBe("arm");
+    expect(d?.untilMs).toBe(NOW + DIRECTIVE_OVERNIGHT_MS);
+  });
+  test("a polite spoken overnight request still arms — duration-grade intent survives a question mark", () => {
+    expect(parseAutoContinueDirective("could you auto-continue overnight?", NOW)?.action).toBe("arm");
+  });
+  test("an explicit duration beats the overnight default when both appear", () => {
+    expect(parseAutoContinueDirective("auto-continue for 10 hours overnight", NOW)?.untilMs).toBe(NOW + 10 * 3_600_000);
+  });
+  test("overnight with a cap is honoured", () => {
+    expect(parseAutoContinueDirective("auto-continue overnight, up to 30 turns", NOW)?.cap).toBe(30);
+  });
+  test("talking ABOUT an overnight run arms nothing", () => {
+    expect(parseAutoContinueDirective("review the overnight auto-continue logs", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("the auto-continue overnight run failed last night", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("why did auto-continue stop overnight", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("should we auto-continue overnight?", NOW)).toBeNull();
   });
 });
 

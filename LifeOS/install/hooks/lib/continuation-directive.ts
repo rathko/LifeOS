@@ -20,6 +20,11 @@
 
 /** Bare "auto-continue on" / "until done" get this window. */
 export const DIRECTIVE_DEFAULT_MS = 2 * 60 * 60 * 1000;
+/** The overnight family ("overnight", "all night", "until morning", "while I
+ * sleep") gets a night's worth. Fixed rather than clock-derived on purpose:
+ * "until 08:00 local" would make the grant's size depend on when it was said,
+ * and a deterministic grammar should not have a clock inside it. */
+export const DIRECTIVE_OVERNIGHT_MS = 8 * 60 * 60 * 1000;
 /** No single utterance may license more than this, however phrased. */
 export const DIRECTIVE_MAX_MS = 12 * 60 * 60 * 1000;
 /** Continues per grant window. Higher than the standing HARD_CAP of 8 because an
@@ -38,6 +43,10 @@ const ON = /\bauto[- ]?continue\b[,:]?\s+on\b/i;
 const DURATION = /\bfor\s+(?:the\s+next\s+)?(\d+(?:\.\d+)?)\s*(h|hr|hrs|hours?|m|min|mins|minutes?)\b/i;
 /** Deliberative frames: talking ABOUT arming, not asking for it. */
 const DELIBERATION = /\b(should (we|i)|would it|is it worth|worth it to|do we want|what if (we|i)|whether to)\b/i;
+/** Overnight cue AFTER the keyword, same clause (no sentence punctuation between). */
+const OVERNIGHT = /\bauto[- ]?continue\b[^.?!\n]{0,60}\b(overnight|all night|for the night|(un)?til+ (the )?morning|while i sleep|while i'?m (asleep|away|out|gone)|back in the morning)\b/i;
+/** Analytic chatter about past or observed runs — reading, not directing. */
+const ANALYTIC = /\b(review|debug|check|inspect|read|explain|why|log|logs|failed|failure|ran|stopped|yesterday|last night)\b/i;
 
 export function parseAutoContinueDirective(prompt: string, now = Date.now()): Directive | null {
   const p = String(prompt ?? "").trim();
@@ -45,7 +54,10 @@ export function parseAutoContinueDirective(prompt: string, now = Date.now()): Di
   if (DELIBERATION.test(p)) return null;
 
   // OFF is checked before arming cues so "stop auto-continue" can never re-arm.
-  if (OFF.test(p)) return { action: "off" };
+  // Analytic chatter defuses OFF too: "why did auto-continue stop overnight" is a
+  // question about a run, not an order — and a false null here only leaves the
+  // current state standing, which a plain "auto-continue off" fixes in one line.
+  if (OFF.test(p)) return ANALYTIC.test(p) ? null : { action: "off" };
 
   const clampCap = (n: number) =>
     Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), DIRECTIVE_MAX_CAP) : DIRECTIVE_DEFAULT_CAP;
@@ -58,6 +70,14 @@ export function parseAutoContinueDirective(prompt: string, now = Date.now()): Di
     if (!Number.isFinite(n) || n <= 0) return null;
     const ms = dur[2]!.toLowerCase().startsWith("m") ? n * 60_000 : n * 3_600_000;
     return { action: "arm", untilMs: now + Math.min(ms, DIRECTIVE_MAX_MS), cap };
+  }
+
+  // Overnight family — duration-grade intent (survives a question mark, like an
+  // explicit duration). Two guards keep mention from becoming consent: the cue must
+  // FOLLOW the keyword inside one clause (so "the overnight auto-continue logs"
+  // stays inert), and analytic chatter about runs/logs/failures defuses outright.
+  if (OVERNIGHT.test(p) && !ANALYTIC.test(p)) {
+    return { action: "arm", untilMs: now + DIRECTIVE_OVERNIGHT_MS, cap };
   }
 
   // The cue-less forms ("until done", "on") are weaker evidence of intent, so a
