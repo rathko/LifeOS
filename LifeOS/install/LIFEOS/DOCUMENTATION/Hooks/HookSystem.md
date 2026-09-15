@@ -134,7 +134,7 @@ Claude Code supports the following hook events:
 - Capture prompts for analysis
 - Detect ratings and sentiment
 
-**Current Hooks (fire order per settings.json — 9 hooks):**
+**Current Hooks (fire order per settings.json — 10 hooks):**
 ```json
 {
   "UserPromptSubmit": [
@@ -146,7 +146,8 @@ Claude Code supports the following hook events:
     { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/MemoryTurnStart.hook.ts", "timeout": 8 } ] },
     { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/AlgorithmNudge.hook.ts", "timeout": 5, "async": true } ] },
     { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/TimeContext.hook.ts", "timeout": 5, "async": true } ] },
-    { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/ModelRungGuard.hook.ts", "timeout": 5, "async": true } ] }
+    { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/ModelRungGuard.hook.ts", "timeout": 5, "async": true } ] },
+    { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/ContinuationArm.hook.ts", "timeout": 5 } ] }
   ]
 }
 ```
@@ -199,6 +200,11 @@ Claude Code supports the following hook events:
 **ModelRungGuard.hook.ts** — Off-pin session detection (timeout 5s, async)
 - Compares the `model` pin in `settings.json` against the model on the last assistant message in the transcript, and reports when the session is running below the pinned rung
 - Reports only. A hook cannot set the main loop's carrier, so it names the sanctioned move from OPERATIONAL_RULES § Model selection (dispatch MAX-class work up with a tier alias) rather than asking for a `/model` change. Reads a tail of the transcript; no LLM calls; any error exits 0
+
+**ContinuationArm.hook.ts** — the spoken front door for ContinuationGate (timeout 5s, sync)
+- Deterministic directive parser (`lib/continuation-directive.ts`): saying **"auto-continue for 2 hours"** (or "until done", "on", with an optional "cap N") grants THIS session a time-boxed licence the Stop-side ContinuationGate honours; **"auto-continue off"** revokes it. The keyword must appear with an explicit cue — a question about auto-continue, a code review mentioning it, or a deliberative "should we auto-continue…" arms nothing; a polite spoken request with a duration ("could you auto-continue for 2h?") does
+- Writes a session-scoped `grant` (merge, 0600, read-back-verified) into `MEMORY/STATE/continuation-cap.json`; clamps: 12h window, 50-continue cap. Expiry is the safety property — nothing renews a grant implicitly, and an expired one is indistinguishable from none. No model call anywhere on this path; failures are silent-open (the gate just keeps its standing budget)
+- Division of labour: this hook = arming by utterance; `LIFEOS/TOOLS/ContinuationDoctor.ts` = standing config + wiring checks + verdict history; `ContinuationGate` (Stop) = enforcement, reading the grant fail-closed
 
 > **Historical — retired 2026-07-11 (hooks-BPE pass):**
 > - **`TheRouter.hook.ts` retired entirely** (commit `4dd0fbe19`). It owned per-prompt Mode + Tier classification (emitting `MODE: MINIMAL|NATIVE|ALGORITHM | TIER: E1-E5`); that whole scheme was abolished. There is no successor classifier — the model discovers difficulty from the work, and model rungs now live in `LIFEOS/TOOLS/models.ts` + `AgentInvocation.hook.ts`. Its deterministic router libs (`router-deterministic`, `router-classifier`, `RouterShadow`, `ai-speak-patterns`) were deleted with it.
@@ -273,7 +279,8 @@ Each Stop hook is a self-contained `.hook.ts` file that reads stdin via shared `
   4. `ISAFoldGate.run()` — D-50 enforcement (added 2026-07-29): prod mutated this turn + active run + ISA untouched + the reply silent on ISA state → block. Phrase-independent, so it sees the gap `ISACloseGate`'s completion regex cannot ("rigged and armed" isn't "done")
   5. `ISAGate.run()` — blocks a close (`phase: complete` written this turn) on structural ISA violations (non-M/N progress, fog-at-complete, missing anchors_to); scoped to ISAs touched this turn — the structural tooth complementing ISACloseGate's staleness tooth
   6. `WritingGate.run()` — blocks publication prose without a real Pangram run (strong signals)
-- The FIRST gate returning `decision:"block"` wins; the recovery turn re-runs all gates. Fails open per-gate so one gate's crash never silences the others
+  7. `ContinuationGate.run()` — the throughput gate, and the ONLY reason to KEEP GOING: when the turn asked the principal nothing, produced clean tool evidence, and the declared work is provably unfinished (open ISC criteria on the bound run, or a strict `finished:false` from the `lib/continuation-judge.ts` haiku-tier judge on no-ISA sessions), it hands the run one more turn instead of handing back. **Registered LAST on purpose — every stop-reason outranks it.** Ships in SHADOW (cap 0: verdicts logged to `MEMORY/OBSERVABILITY/continuation-gate.jsonl`, never acted on, no model called on the unarmed no-ISA path); arm/disarm/inspect live with `bun LIFEOS/TOOLS/ContinuationDoctor.ts --arm N | --off | --arm-isa N`, per-ISA via `autocontinue: N` frontmatter, or by SAYING **"auto-continue for 2 hours"** in a prompt (session-scoped expiring grant via `ContinuationArm.hook.ts` — see Section 3). Loop safety: per-run consecutive-continue counter (written and READ BACK before any continuation; reset when the principal speaks), 45-min wall-clock ceiling (`LIFEOS_AUTOCONTINUE_MAX_MS`), hard cap 8, kill switch `CONTINUATIONGATE_OFF=1`
+- Arbitration lives in `lib/gate-chain.ts`: the FIRST gate returning `decision:"block"` wins and short-circuits, and a block from ANY gate outranks a non-block object (e.g. a `systemMessage`) from an earlier one — the old inline reducer kept the first object outright, which silently swallowed later blocks. The recovery turn re-runs all gates. Fails open per-gate so one gate's crash never silences the others
 - `OutputFormatGate.run()` was dropped from the chain 2026-07-11 (it was telemetry-only and policed the retired mode-banner system; voice/format drift is now `DriftReminder`'s job)
 
 **`MemoryReviewFire.hook.ts`** (v2) — owns the WHOLE memory-review cadence (consolidated 2026-07-11)

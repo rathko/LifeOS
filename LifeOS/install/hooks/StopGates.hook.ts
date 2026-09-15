@@ -15,18 +15,21 @@
  *   4. ISAFoldGate.run()       — D-50 teeth: prod mutated + ISA untouched blocks
  *   5. WritingGate.run()       — authored-prose audit teeth (strong signals block)
  *
- * Decision semantics: the FIRST gate returning a `decision:"block"` wins and
- * is emitted; later gates are still evaluated for their telemetry EXCEPT after
- * a block (matching the old behavior closely enough — two simultaneous blocks
- * were never actionable, the harness takes one recovery turn anyway).
- * `{continue:true}` returns (stop_hook_active recovery) are emitted once.
+ * Decision semantics live in lib/gate-chain.ts (testable on its own): the FIRST
+ * gate returning a `decision:"block"` wins and short-circuits, and a block from
+ * ANY gate outranks a non-block object from an earlier one. The old inline
+ * reducer kept the first object outright, so a passive `systemMessage` from an
+ * early gate silently swallowed a block from any gate below it — harmless only
+ * while every gate short-circuited on `stop_hook_active` recovery, and fatal
+ * for ContinuationGate, which deliberately does not.
  *
- * Failure mode: each gate's run() fails open internally; this wrapper catches
+ * Failure mode: each gate's run() fails open internally; the chain catches
  * anything residual per-gate so one gate's crash never silences the others.
  * The gate must never be why a Stop breaks — always exit 0.
  */
 
 import { readHookInput } from "./lib/hook-io";
+import { decide, type GateFn } from "./lib/gate-chain";
 import { run as formatGate } from "./FormatGate.hook";
 import { run as verificationGate } from "./VerificationGate.hook";
 import { run as isaCloseGate } from "./ISACloseGate.hook";
@@ -34,8 +37,7 @@ import { run as isaFoldGate } from "./ISAFoldGate.hook";
 import { run as isaStructureGate } from "./ISAGate.hook";
 import { run as writingGate } from "./WritingGate.hook";
 import { run as deployRegistrationGate } from "./DeployRegistrationGate.hook";
-
-type GateFn = (input: any) => Promise<object | null>;
+import { run as continuationGate } from "./ContinuationGate.hook";
 
 // OutputFormatGate (mode-banner telemetry) removed 2026-07-11; FormatGate is
 // its unified-format successor WITH TEETH (2026-07-11): deterministic
@@ -64,25 +66,18 @@ const GATES: Array<[string, GateFn]> = [
   // curated inventory before the turn ends. Fires once per domain per session.
   ["DeployRegistrationGate", deployRegistrationGate],
   ["WritingGate", writingGate],
+  // ContinuationGate: MUST STAY LAST — every other gate is a reason to STOP; this
+  // is the only reason to CONTINUE, so any stop outranks it. Registering it
+  // anywhere else is a real bug, not a style choice. Ships in shadow mode (cap 0);
+  // arm with `bun LIFEOS/TOOLS/ContinuationDoctor.ts --arm N`.
+  ["ContinuationGate", continuationGate],
 ];
 
 (async () => {
   const input = await readHookInput();
   if (!input) process.exit(0);
 
-  let emitted: object | null = null;
-  for (const [name, gate] of GATES) {
-    try {
-      const d = await gate(input);
-      if (d && !emitted) {
-        emitted = d;
-        // A block ends the turn's gate evaluation — the recovery turn re-runs all gates.
-        if ((d as { decision?: string }).decision === "block") break;
-      }
-    } catch (err) {
-      console.error(`[StopGates] ${name} error:`, err);
-    }
-  }
+  const emitted = await decide(GATES, input);
   if (emitted) console.log(JSON.stringify(emitted));
   process.exit(0);
 })().catch((err) => {
