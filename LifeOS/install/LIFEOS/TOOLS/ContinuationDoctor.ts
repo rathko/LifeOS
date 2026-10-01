@@ -17,6 +17,7 @@
  *   bun ContinuationDoctor.ts --arm 3      # arm the no-ISA path, live, no restart
  *   bun ContinuationDoctor.ts --off        # disarm it
  *   bun ContinuationDoctor.ts --arm-isa 3  # arm the ISA path's standing cap, live
+ *   bun ContinuationDoctor.ts --arm-questions 3   # let it defer up to 3 non-blocking questions
  *   bun ContinuationDoctor.ts --off-isa    # back to shadow
  *
  * Exit codes: 0 = wiring intact, 1 = a wiring check failed (the upgrade tripwire).
@@ -31,6 +32,7 @@ const HOOKS = join(CLAUDE, "hooks");
 const LIFEOS = process.env.LIFEOS_DIR || join(CLAUDE, "LIFEOS");
 const VERDICTS = join(LIFEOS, "MEMORY", "OBSERVABILITY", "continuation-gate.jsonl");
 const CAP_PATH = join(LIFEOS, "MEMORY", "STATE", "continuation-cap.json");
+const QUESTIONS_PATH = join(LIFEOS, "MEMORY", "STATE", "continuation-questions.json");
 
 const read = (p: string): string => { try { return readFileSync(p, "utf-8"); } catch { return ""; } };
 
@@ -55,7 +57,7 @@ function currentIsaCap(): number {
  * Arm or disarm one path. MERGES rather than overwrites: the file also carries the
  * other path's cap, and a whole-object write would silently revoke it.
  */
-function setCap(n: number, key: "all" | "isa" = "all"): void {
+function setCap(n: number, key: "all" | "isa" | "questions" = "all"): void {
   mkdirSync(dirname(CAP_PATH), { recursive: true });
   let existing: Record<string, unknown> = {};
   try { existing = JSON.parse(read(CAP_PATH)) ?? {}; } catch { /* start fresh */ }
@@ -66,7 +68,7 @@ function setCap(n: number, key: "all" | "isa" = "all"): void {
   // pre-existing looser file would otherwise keep its old permissions forever.
   writeFileSync(CAP_PATH, JSON.stringify(existing, null, 2), { mode: 0o600 });
   chmodSync(CAP_PATH, 0o600);
-  const label = key === "all" ? "no-ISA path" : "ISA path standing cap";
+  const label = key === "all" ? "no-ISA path" : key === "isa" ? "ISA path standing cap" : "question deferral";
   console.log(n > 0
     ? `✅ Armed the ${label}: up to ${n} auto-continue${n === 1 ? "" : "s"} per run. Live in every open session on its next turn.`
     : `⭕ ${label} back to ${key === "all" ? "off" : "shadow"}. Live in every open session on its next turn.`);
@@ -80,6 +82,17 @@ if (armIsaIdx > -1) {
   process.exit(0);
 }
 if (process.argv.includes("--off-isa")) { setCap(0, "isa"); process.exit(0); }
+
+// Deferral is armed on its OWN key and clamped lower than the continue caps: five
+// unanswered questions is as far as a run may drift from its instructions.
+const armQIdx = process.argv.indexOf("--arm-questions");
+if (armQIdx > -1) {
+  const n = Number(process.argv[armQIdx + 1]);
+  if (!Number.isFinite(n) || n < 0) { console.error("usage: --arm-questions <0-5>"); process.exit(2); }
+  setCap(Math.min(Math.floor(n), 5), "questions");
+  process.exit(0);
+}
+if (process.argv.includes("--off-questions")) { setCap(0, "questions"); process.exit(0); }
 
 const armIdx = process.argv.indexOf("--arm");
 if (armIdx > -1) {
@@ -154,6 +167,27 @@ const wouldHave = verdicts.byWhy["shadow-would-continue"] ?? 0;
 console.log(wouldHave > 0
   ? `  → ${wouldHave} turn(s) it would have continued while in shadow.`
   : "  → no would-have-continued turns yet; every verdict so far was a hand-back.");
+
+// Question deferral — the non-blocking-question path.
+try {
+  // read() yields "" for an absent file, and JSON.parse("") throws — which would make
+  // this whole section silently vanish on a fresh install, the exact failure mode the
+  // doctor exists to prevent. Default the text, not the behaviour.
+  const qCap = Number(JSON.parse(read(CAP_PATH) || "{}")?.questions ?? 0) || 0;
+  const deferred = verdicts.byWhy["asks-principal-deferred"] ?? 0;
+  const blocked = verdicts.byWhy["asks-principal-blocking"] ?? 0;
+  const wouldDefer = verdicts.byWhy["shadow-would-defer"] ?? 0;
+  console.log("\nQUESTION DEFERRAL — a question in PROSE judged non-blocking continues under a stated assumption");
+  console.log(`  ${qCap > 0 ? "✅ ARMED" : "⭕ shadow"}  up to ${qCap} deferral(s) per human turn (tool asks are NEVER deferred)`);
+  console.log("  arm/disarm live: bun ContinuationDoctor.ts --arm-questions 3 | --off-questions");
+  console.log(`  deferred=${deferred}  blocking=${blocked}${wouldDefer ? `  would-have-deferred(shadow)=${wouldDefer}` : ""}`);
+  const pending = JSON.parse(read(QUESTIONS_PATH) || "{}");
+  const open = Object.entries(pending).flatMap(([sess, led]) => (led?.questions ?? []).map((q) => ({ sess, q })));
+  if (open.length) {
+    console.log(`  ⚠ ${open.length} question(s) deferred and not yet rendered — they surface on the next hand-back:`);
+    for (const o of open.slice(0, 5)) console.log(`      [${o.sess.slice(0, 8)}] proceeded on: ${o.q.assumption}`);
+  }
+} catch { /* no cap file / no ledger ⇒ nothing to report */ }
 
 // Live grant, if any — the "auto-continue for 2 hours" utterance surface.
 try {

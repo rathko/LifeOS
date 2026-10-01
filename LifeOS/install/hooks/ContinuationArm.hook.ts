@@ -23,7 +23,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { parseAutoContinueDirective, type Directive } from "./lib/continuation-directive";
+import { parseAutoContinueDirective, isBareStop, type Directive } from "./lib/continuation-directive";
 
 const LIFEOS = process.env.LIFEOS_DIR || join(process.env.HOME!, ".claude", "LIFEOS");
 const CAP_PATH = join(LIFEOS, "MEMORY", "STATE", "continuation-cap.json");
@@ -31,6 +31,14 @@ const CAP_PATH = join(LIFEOS, "MEMORY", "STATE", "continuation-cap.json");
 /** Apply a parsed directive to the cap file. Exported for tests; the shim below
  * owns stdin/stdout. Returns the user-facing confirmation, or null when nothing
  * changed (including every failure — fail silent-open, never break a prompt). */
+/** True when this session currently holds an unexpired grant. */
+export function liveGrantFor(session: string, capPath: string = CAP_PATH): boolean {
+  try {
+    const g = JSON.parse(readFileSync(capPath, "utf-8"))?.grant;
+    return !!g && g.session === session && typeof g.untilMs === "number" && Date.now() < g.untilMs;
+  } catch { return false; }
+}
+
 export function applyDirective(d: Directive, session: string, capPath: string = CAP_PATH): string | null {
   try {
     let existing: Record<string, unknown> = {};
@@ -82,7 +90,14 @@ if (import.meta.main) {
     const prompt = input.prompt ?? "";
     if (!session || !prompt) process.exit(0);
 
-    const d = parseAutoContinueDirective(prompt);
+    let d = parseAutoContinueDirective(prompt);
+    // A bare "stop" carries no keyword, so the parser cannot read it as a directive on
+    // its own. But if a GRANT IS LIVE for this session, the principal is being obeyed
+    // unattended, and in that state the only safe reading of "stop" is stop. Without this,
+    // the turn ended while the grant stayed live to its deadline and the next working turn
+    // picked it back up (raised by Martins Zaumanis, 2026-10-01). The failure direction is
+    // a needlessly ended grant, which is the correct way to be wrong about autonomy.
+    if (!d && isBareStop(prompt) && liveGrantFor(session)) d = { action: "off" };
     if (!d) process.exit(0);
     const confirmation = applyDirective(d, session);
     if (confirmation) {

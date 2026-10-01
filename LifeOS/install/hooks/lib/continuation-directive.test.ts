@@ -9,7 +9,7 @@
  * while a missed grant costs one rephrase.
  */
 import { expect, test, describe } from "bun:test";
-import { parseAutoContinueDirective, DIRECTIVE_DEFAULT_MS, DIRECTIVE_MAX_MS, DIRECTIVE_DEFAULT_CAP, DIRECTIVE_MAX_CAP, DIRECTIVE_OVERNIGHT_MS } from "./continuation-directive";
+import { parseAutoContinueDirective, isBareStop, DIRECTIVE_DEFAULT_MS, DIRECTIVE_MAX_MS, DIRECTIVE_DEFAULT_CAP, DIRECTIVE_MAX_CAP, DIRECTIVE_OVERNIGHT_MS } from "./continuation-directive";
 
 const NOW = 1_000_000;
 
@@ -132,5 +132,78 @@ describe("NON-arming — mention is not consent", () => {
   test("empty and garbage are inert", () => {
     expect(parseAutoContinueDirective("", NOW)).toBeNull();
     expect(parseAutoContinueDirective("   ", NOW)).toBeNull();
+  });
+});
+
+// ── Reviewer-reported defects (Martins Zaumanis, 2026-10-01) ──────────────────
+// He ran these exact strings against this parser on his own install and every one
+// reproduced. The common root: OFF matched a stop-word ANYWHERE in the prompt and
+// was checked before DURATION, so a perfectly clear arming request that happened to
+// contain "stop" or "end" disarmed instead. Direction of harm matters — an accidental
+// DISARM is only lost throughput, but it looks exactly like the feature not working,
+// which is worse for adoption than a missed grant.
+describe("reviewer-reported: an off-word elsewhere in the prompt must not disarm", () => {
+  test.each([
+    ["auto-continue for 2 hours and stop when the tests pass", 2 * 3_600_000],
+    ["auto-continue for 2h, work to the end of the list", 2 * 3_600_000],
+    ["auto-continue for 90m, then stop", 90 * 60_000],
+    ["auto-continue for 3 hours and end with a summary", 3 * 3_600_000],
+  ])("'%s' arms", (p, ms) => {
+    const d = parseAutoContinueDirective(p, NOW);
+    expect(d?.action).toBe("arm");
+    expect(d?.untilMs).toBe(NOW + ms);
+  });
+  test.each([
+    "auto-continue off",
+    "stop auto-continue",
+    "turn off auto-continue",
+    "cancel the auto-continue",
+    "disable auto-continue now",
+    "auto-continue stop",
+  ])("'%s' still reads as off", (p) => {
+    expect(parseAutoContinueDirective(p, NOW)).toEqual({ action: "off" });
+  });
+  test("a negated stop does not disarm", () => {
+    expect(parseAutoContinueDirective("don't stop auto-continue", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("do not cancel auto-continue", NOW)).toBeNull();
+  });
+});
+
+describe("reviewer-reported: spelled-out durations (dictation produces words, not digits)", () => {
+  test.each([
+    ["auto-continue for two hours", 2 * 3_600_000],
+    ["auto-continue for one hour", 3_600_000],
+    ["auto-continue for ninety minutes", 90 * 60_000],
+    ["auto-continue for half an hour", 30 * 60_000],
+    ["auto-continue for a couple of hours", 2 * 3_600_000],
+  ])("'%s' arms for the stated window", (p, ms) => {
+    expect(parseAutoContinueDirective(p, NOW)?.untilMs).toBe(NOW + ms);
+  });
+});
+
+describe("reviewer-reported: an overnight grant plus a real task verb must arm", () => {
+  test.each([
+    "auto-continue overnight and review the open PRs",
+    "auto-continue all night and check the failing suites",
+    "auto-continue until morning, debug the flaky test",
+  ])("'%s' arms", (p) => {
+    expect(parseAutoContinueDirective(p, NOW)?.action).toBe("arm");
+  });
+  test("but talking ABOUT a past run still arms nothing", () => {
+    expect(parseAutoContinueDirective("review the overnight auto-continue logs", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("the auto-continue overnight run failed last night", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("why did auto-continue stop overnight", NOW)).toBeNull();
+    expect(parseAutoContinueDirective("should we auto-continue overnight?", NOW)).toBeNull();
+  });
+});
+
+describe("reviewer-reported: a bare stop-word should end a live grant", () => {
+  test("isBareStop recognises the short interjections, and nothing else", () => {
+    for (const p of ["stop", "Stop.", "halt", "stop please", "that's enough", "enough"]) {
+      expect(isBareStop(p)).toBe(true);
+    }
+    for (const p of ["stop the deploy and fix the test", "do not stop", "stopping the service is fine", ""]) {
+      expect(isBareStop(p)).toBe(false);
+    }
   });
 });

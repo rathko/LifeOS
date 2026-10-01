@@ -77,6 +77,7 @@ import { findActiveSessionByUUID, findArtifactPath, countCriteria, parseCriteria
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync, statSync, unlinkSync } from "fs";
 import { dirname, join } from "path";
 import { askJudge } from "./lib/continuation-judge";
+import { triageQuestion, assumptionClause, flushQuestionLedger } from "./lib/continuation-questions";
 
 const LIFEOS = process.env.LIFEOS_DIR || join(process.env.HOME!, ".claude", "LIFEOS");
 const OBS_PATH = join(LIFEOS, "MEMORY", "OBSERVABILITY", "continuation-gate.jsonl");
@@ -108,9 +109,42 @@ export function stripNoise(msg: string): string {
 }
 
 /** Everything the author actually says is askable prose — only code, quotes and
- * HTML comments are stripped. A question asked in a closing summary still counts. */
+ * HTML comments are stripped. A question asked in a closing summary still counts.
+ *
+ * URLs are stripped too: a bare link with a query string ("live at
+ * https://x/page?id=4") made the `?` test fire and handed back a perfectly clean
+ * deploy turn (reported by Martins Zaumanis, 2026-10-01). */
 export function askableProse(message: string): string {
-  return stripNoise(message).replace(/<!--[\s\S]*?-->/g, " ");
+  return stripNoise(message)
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/\bhttps?:\/\/\S+/gi, " ")
+    .replace(/\b(?:www\.|\S+\.(?:com|org|net|io|dev|sh|ai)\/)\S*/gi, " ");
+}
+
+/** An OFFER to do more work ("want me to…?") versus a QUESTION the principal must
+ * answer. Both hand back today, but they are different problems with different
+ * cures: a turn-boundary problem is this gate's business, while a reply that keeps
+ * offering instead of acting is a model/steering problem no gate should paper over.
+ * The reviewer's install measured 6.1% of replies ending in an offer with roughly
+ * one in ten ever taken up — invisible in the log until the two are split. */
+// Narrow on purpose. "Next up is the merger" is a statement of INTENT, not an offer,
+// and an early version of this list matched it — caught by the suite's oldest
+// asksPrincipal case, which is exactly what that case is for.
+const OFFER =
+  /\b(want me to|shall I|should I|do you want( me)?|would you like|let me know (if|whether)|say the word|happy to\b|I can (also )?(do|add|try|run) (that|this|it)|anything else)\b/i;
+
+export type AskKind = "question" | "offer" | null;
+
+/** Classify the ask, for telemetry and for the triage path. */
+export function askKind(message: string): AskKind {
+  const prose = askableProse(message);
+  const hasQuestionMark = /\?/.test(prose);
+  const isOffer = OFFER.test(prose);
+  if (isOffer && !/(which|what|who|when|where|how|why)\b[^.?!]{0,60}\?/i.test(prose)) return "offer";
+  if (hasQuestionMark) return "question";
+  return /\b(your call|up to you|which (one|option|way)|pick one|confirm (this|that|before)|tell me (if|which|whether)|awaiting|waiting (on|for) (you|your)|need(s)? your (input|decision|approval|sign[- ]?off))\b/i.test(prose)
+    ? "question"
+    : null;
 }
 
 /** Any genuine question put to the principal. Conservative on purpose: a false
@@ -119,9 +153,7 @@ export function askableProse(message: string): string {
  * localized install should extend the phrase list, and the miss cost is bounded
  * by the cap either way. */
 export function asksPrincipal(message: string): boolean {
-  const prose = askableProse(message);
-  if (/\?/.test(prose)) return true;
-  return /\b(shall I|should I|do you want|would you like|want me to|let me know|your call|up to you|which (one|option|way)|pick one|confirm (this|that|before)|say the word|tell me (if|which|whether)|awaiting|waiting (on|for) (you|your)|need(s)? your (input|decision|approval|sign[- ]?off))\b/i.test(prose);
+  return askKind(message) !== null;
 }
 
 /** Real work happened this turn, and nothing in it failed. A no-tool turn is
@@ -398,7 +430,13 @@ export function askedViaTool(transcriptPath: string): boolean {
     for (let i = lines.length - 1; i >= 0; i--) {
       const l = lines[i]!;
       if (l.includes('"origin"') && l.includes('"kind":"human"')) return false;  // hit the turn boundary first
-      if (l.includes('"AskUserQuestion"')) return true;
+      // Match the tool_use NAME FIELD, not the bare string: scanning for
+      // `"AskUserQuestion"` anywhere meant any session editing these very hooks (or
+      // quoting the tool in prose) handed back on every turn — reported by Martins
+      // Zaumanis, 2026-10-01, and a real tax on exactly the sessions that maintain
+      // this feature. Still a text scan (the window is a tail of raw JSONL), but one
+      // that requires the shape a genuine tool call has.
+      if (/"name"\s*:\s*"AskUserQuestion"/.test(l)) return true;
     }
     return truncated;  // boundary never seen in a clipped window ⇒ unknowable ⇒ hand back
   } catch {}
@@ -420,15 +458,17 @@ async function runJudgePath(
   input: HookInput,
   session: string,
   message: string,
-  asked: { inProse: boolean; viaTool: boolean },
+  asked: { inProse: boolean; viaTool: boolean; kind: AskKind },
   cleanliness: { ok: boolean; why: string },
   turnEvents: TxEvent[],
 ): Promise<object | null> {
   const { cap, maxMs, grant } = resolveBudget(session);
   const base = { path: "no-isa", cap, ...(grant ? { grant_until: new Date(grant.untilMs).toISOString() } : {}) };
   if (cap === 0) { obs({ verdict: "hand-back", why: "not-armed", ...base }); return null; }
+  // A question raised through the TOOL stays an absolute veto — the model itself
+  // judged that one blocking. A question in PROSE is triaged below, once the
+  // deterministic gates have passed and the human-turn id is known.
   if (asked.viaTool) { obs({ verdict: "hand-back", why: "asks-principal", ...base, ask: "tool" }); return null; }
-  if (asked.inProse) { obs({ verdict: "hand-back", why: "asks-principal", ...base, ask: "prose" }); return null; }
   if (!cleanliness.ok) { obs({ verdict: "hand-back", why: cleanliness.why, ...base }); return null; }
 
   const key = `session:${session}`;
@@ -444,9 +484,26 @@ async function runJudgePath(
   // 01:00 even if this particular run only started at 00:55.
   if (grant && Date.now() >= grant.untilMs) { obs({ verdict: "hand-back", why: "grant-expired", ...base, count }); return null; }
 
-  // Only now is a model worth spending: every deterministic gate has passed.
-  const verdict = await askJudge(message, turnEvents.filter((e) => e.kind !== "user-text").map((e) => ({ name: e.tool, ok: !e.isError })));
+  // Only now is a model worth spending: every deterministic gate has passed, and a
+  // turn already over cap or past its ceiling spent nothing.
+  //
+  // The two model calls START TOGETHER when a prose question is present: they are
+  // independent reads of the same reply, each budgeted at 40s, and the hook window
+  // is 60s. Sequential triage-then-judge could exceed it; the judge's small call is
+  // wasted when the triage says blocking, which is the cheaper trade.
+  const judgePromise = askJudge(message, turnEvents.filter((e) => e.kind !== "user-text").map((e) => ({ name: e.tool, ok: !e.isError })));
+  let deferredAssumption = "";
+  if (asked.inProse) {
+    const t = await triageQuestion(message, session, humanTurn, { ...base, count, ask: asked.kind ?? "prose" });
+    if (!t.defer) { void judgePromise.catch(() => {}); return null; }
+    deferredAssumption = t.assumption;
+  }
+  const verdict = await judgePromise;
   if (!verdict) { obs({ verdict: "hand-back", why: "judge-unavailable", ...base, count }); return null; }
+  // The model calls can burn 40s, so the deadlines checked before them are stale: a Stop
+  // that began just inside its grant could otherwise authorize a turn after expiry.
+  if (Date.now() - firstAt > maxMs) { obs({ verdict: "hand-back", why: "wallclock-ceiling", ...base, count, late: true }); return null; }
+  if (grant && Date.now() >= grant.untilMs) { obs({ verdict: "hand-back", why: "grant-expired", ...base, count, late: true }); return null; }
   if (verdict.finished) { obs({ verdict: "hand-back", why: "judge-says-finished", ...base, count, judge: verdict.why }); return null; }
 
   const commit = commitContinue(key, humanTurn, cap);
@@ -458,13 +515,14 @@ async function runJudgePath(
   return {
     decision: "block",
     reason:
-      `CONTINUE [ContinuationGate ${commit.count}/${cap}, no-ISA path]. Your reply asked ${who} nothing, this turn's ` +
+      `CONTINUE [ContinuationGate ${commit.count}/${cap}, no-ISA path]. ${deferredAssumption ? `Your reply asked ${who} something a second opinion judged non-blocking` : `Your reply asked ${who} nothing`}, this turn's ` +
       `tool evidence was clean, and a second opinion judged the work unfinished: "${verdict.why || "work still outstanding"}". ` +
       `So this is a turn boundary, not a decision point.\n\n` +
       `Carry on with what you were doing. Do NOT re-greet, re-summarise, or restate the plan. If you genuinely need ` +
       `${who} — a real choice, an irreversible or external action — or the work really is done, say so ` +
       `plainly and this gate hands back automatically. ` +
       `Budget: ${left} auto-continue${left === 1 ? "" : "s"} left before ${who} is asked.`
+      + await assumptionClause(deferredAssumption)
       + (grant
         ? `\n\nUNATTENDED RUN: ${who} said auto-continue until ${new Date(grant.untilMs).toISOString()}. ` +
           `They are away and will read the result later, so do not wait on them, and do not stop to ask ` +
@@ -475,8 +533,24 @@ async function runJudgePath(
 
 // ── Gate ─────────────────────────────────────────────────────────────────────
 
-/** Returns a decision object to emit, or null. Pure of exit/stdout. */
+/**
+ * Returns a decision object to emit, or null. Pure of exit/stdout.
+ *
+ * This is a thin wrapper around `decide` for ONE reason: the question-ledger
+ * flush. A hand-back must render every question this gate deferred, and `decide`
+ * has a dozen `return null` exits — flushing at this single choke point is what
+ * guarantees that none of them can strand a question.
+ */
 export async function run(input: HookInput): Promise<object | null> {
+  const session = input.session_id ?? "";
+  let out: object | null = null;
+  try { out = await decide(input); } catch { out = null; }   // a crash must never block a Stop
+  if (!session) return out;
+  try { return flushQuestionLedger(session, lastHumanTurnId(input.transcript_path), out); } catch { return out; }
+}
+
+/** The gate proper. Call `run`, not this — see the ledger flush above. */
+async function decide(input: HookInput): Promise<object | null> {
   if (process.env.CONTINUATIONGATE_OFF === "1") return null;
 
   const message = input.last_assistant_message ?? "";
@@ -490,7 +564,11 @@ export async function run(input: HookInput): Promise<object | null> {
   // The deterministic predicates, computed once and shared by both paths so the
   // ISA path and the no-ISA path can never disagree about whether the principal
   // was asked something. Cheap: two regex passes plus one transcript scan.
-  const asked = { inProse: asksPrincipal(message), viaTool: askedViaTool(input.transcript_path) };
+  // `kind` rides along so the log can tell an OFFER ("want me to…?") from a real
+  // QUESTION. Both still hand back; only the diagnosis differs, and without the split
+  // an install cannot tell a turn-boundary problem from a model-keeps-offering problem.
+  const kind = askKind(message);
+  const asked = { inProse: kind !== null, viaTool: askedViaTool(input.transcript_path), kind };
   let turnEvents: TxEvent[] = [];
   try { turnEvents = parseTurnEvents(input.transcript_path); } catch { /* empty ⇒ not clean ⇒ hand back */ }
   const cleanliness = evidenceClean(turnEvents);
@@ -524,9 +602,9 @@ export async function run(input: HookInput): Promise<object | null> {
   const budget = resolveBudget(session);
   const cap = Math.max(isaCap, budget.grant ? budget.cap : 0);
 
-  // A question — via tool or in prose — ends the streak, armed or not.
+  // A question via TOOL ends the streak, armed or not. Prose is triaged after the
+  // budget checks below, so an over-cap turn never spends a model call.
   if (asked.viaTool) { obs({ verdict: "hand-back", why: "asks-principal", slug: active.slug, cap, ask: "tool" }); return null; }
-  if (asked.inProse) { obs({ verdict: "hand-back", why: "asks-principal", slug: active.slug, cap, ask: "prose" }); return null; }
 
   // Real, clean work this turn.
   if (!cleanliness.ok) { obs({ verdict: "hand-back", why: cleanliness.why, slug: active.slug, cap }); return null; }
@@ -557,6 +635,19 @@ export async function run(input: HookInput): Promise<object | null> {
   }
   if (Date.now() - firstAt > maxMs) { obs({ verdict: "hand-back", why: "wallclock-ceiling", ...base }); return null; }
 
+  // Prose question: triaged now that the deterministic gates have passed. This is
+  // the ISA path's only model call, and a blocking verdict hands back exactly as
+  // the old absolute veto did.
+  let deferredAssumption = "";
+  if (asked.inProse) {
+    const t = await triageQuestion(message, session, humanTurn, { ...base, ask: asked.kind ?? "prose" });
+    if (!t.defer) return null;
+    deferredAssumption = t.assumption;
+    // Same staleness problem as the no-ISA path: the triage may have taken 40s.
+    if (Date.now() - firstAt > maxMs) { obs({ verdict: "hand-back", why: "wallclock-ceiling", ...base, late: true }); return null; }
+    if (budget.grant && Date.now() >= budget.grant.untilMs) { obs({ verdict: "hand-back", why: "grant-expired", ...base, late: true }); return null; }
+  }
+
   // The counter is the loop breaker — the cap is re-checked and spent under the
   // state lock; no serialized, persisted counter means no continuation.
   const commit = commitContinue(active.slug, humanTurn, cap);
@@ -569,14 +660,15 @@ export async function run(input: HookInput): Promise<object | null> {
     decision: "block",
     reason:
       `CONTINUE [ContinuationGate ${commit.count}/${cap}]. Run '${active.slug}' has ${open} of ${total} ISC criteria still open, ` +
-      `this turn's tool evidence was clean, and your reply asked ${who} nothing — so this is a turn boundary, not a decision point. ` +
+      `this turn's tool evidence was clean, and ${deferredAssumption ? `the question you asked ${who} was judged non-blocking` : `your reply asked ${who} nothing`} — so this is a turn boundary, not a decision point. ` +
       `Keep going instead of handing back.\n\n` +
       `Next open criterion: ${nextCriterion ?? "(see the ISA's ISC Criteria section)"}\n` +
       `ISA: ${isaPath}\n\n` +
       `Advance that criterion now. Do NOT re-greet, re-summarise what you just did, or restate the plan — continue the work and ` +
       `close the criterion on real evidence. If you genuinely need ${who} (a real choice, an irreversible or external action, ` +
       `or the work is actually done), say so plainly in your next reply and this gate will hand back automatically. ` +
-      `Budget: ${left} auto-continue${left === 1 ? "" : "s"} left before ${who} is asked.`,
+      `Budget: ${left} auto-continue${left === 1 ? "" : "s"} left before ${who} is asked.`
+      + await assumptionClause(deferredAssumption),
   };
 }
 
