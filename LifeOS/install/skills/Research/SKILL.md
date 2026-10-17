@@ -1,7 +1,7 @@
 ---
 name: Research
-version: 1.5.16
-description: "Multi-agent web research with mandatory URL verification, confidence-tagged output, and four depth modes (quick to deep investigation). USE WHEN research, do research, quick research, extensive research, deep investigation, find information, investigate, extract alpha, analyze content, retrieve content, AI trends, enhance content, extract knowledge, web scraping, YouTube extraction, map landscape, competitive analysis, find it, find this, find this product, identify this, what is this, what's that thing, track down, locate, help me find, I can't find X online, can't find it online, source this — never substitute raw WebSearch/WebFetch for a multi-source find/identify/investigate request. NOT FOR people/company/entity deep background, academic papers (use ArXiv), JSON entity extraction, or content-adaptive wisdom extraction (use ExtractWisdom)."
+version: 1.6.0
+description: "Multi-agent web research with mandatory URL verification, confidence-tagged output, and four depth modes (quick to deep investigation). USE WHEN research, do research, quick research, cited report, Perplexity-style report, extensive research, deep investigation, find information, investigate, extract alpha, analyze content, retrieve content, AI trends, enhance content, extract knowledge, web scraping, YouTube extraction, map landscape, competitive analysis, find it, find this, find this product, identify this, what is this, what's that thing, track down, locate, help me find, I can't find X online, can't find it online, source this — never substitute raw WebSearch/WebFetch for a multi-source find/identify/investigate request. NOT FOR people/company/entity deep background, academic papers (use ArXiv), JSON entity extraction, or content-adaptive wisdom extraction (use ExtractWisdom)."
 context: fork
 background: false
 ---
@@ -16,6 +16,7 @@ background: false
 | "quick research" / "minor research" | → Quick mode (1 Perplexity agent) |
 | "extensive research" / "deep research" | → Extensive mode (7 explorers + 2 verifiers) |
 | "deep investigation" / "investigate [topic]" / "map the [X] landscape" | → Deep Investigation (iterative + verification) |
+| "cited report" / "Perplexity-style report" / "research report I can share" | → CitedReport (planned sections, inline [n] citations, claim-level citation check, self-contained HTML) |
 
 **"Research" alone = Standard mode. No exceptions.**
 
@@ -106,6 +107,7 @@ Before executing any workflow, verify context sufficiency: do I have what I need
 | StandardResearch | Standard research — DEFAULT (3 agents: Claude + Gemini + Perplexity, cross-checked) | `Workflows/StandardResearch.md` |
 | ExtensiveResearch | Extensive research (7 explorers + 2 verifiers = 9 agents) | `Workflows/ExtensiveResearch.md` |
 | DeepInvestigation | Deep investigation / iterative research / map the [X] landscape (progressive deepening, loop-compatible) | `Workflows/DeepInvestigation.md` |
+| CitedReport | Perplexity-style report / cited report / report with inline citations and 100+ references / shareable HTML research report; add `--cross-check` to compare Gemini vs Perplexity | `Workflows/CitedReport.md` |
 | DeepVerifiedResearch | Deep verified / fact-checked research — slowest tier, claim-level adversarial verification (see notes below) | `Workflows/DeepVerifiedResearch.mjs` |
 | research.mjs | EXPERIMENTAL deterministic port of Standard + Extensive — do NOT route real research here until a smoke run lands (see Mandatory Trigger note) | `Workflows/research.mjs` |
 | Verify | Verify research findings / cross-check claims / confidence scoring | `Workflows/Verify.md` |
@@ -216,6 +218,7 @@ See `Workflows/DeepInvestigation.md` for full workflow details.
 - **"research" alone = Standard mode (3 agents + cross-check). Never default to Quick.** Users saying "research this" expect thorough results.
 - **Due diligence, background checks, people lookup → a dedicated OSINT/entity-investigation skill, NOT Research.** Research handles general investigation; entity-specific deep investigation belongs to that skill.
 - **Don't spawn redundant research agents when you already have the answer in context.** If prior work in the session already covers the topic, skip agent spawning.
+- **CitedReport makes dozens of paid calls (sections, judge batches, summary) — launch it exactly once.** Never prefix the run with an import or `-e` "syntax check": importing a script executes its top level, which runs the whole batch twice. The tool holds a per-output lock and resumes from cached sections, so a retry is the same command again.
 - **"extract alpha" routes to ExtractAlpha workflow — not the ExtractWisdom skill.** Different things.
 - **YouTube extraction uses `fabric -y URL` directly** — don't try to scrape YouTube pages with WebFetch.
 - **The inverse signal is signal.** When pulling fan sentiment, what people hated is as informative as what they loved. Always include a "disappointments" / "Tier C" section.
